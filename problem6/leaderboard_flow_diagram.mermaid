@@ -1,0 +1,131 @@
+sequenceDiagram
+    participant Client as Web Client
+    participant LB as Load Balancer
+    participant API as API Server
+    participant Auth as Auth Service
+    participant Score as Score Service
+    participant DB as PostgreSQL
+    participant Redis as Redis Cache
+    participant WS as WebSocket Hub
+    participant Other as Other Clients
+
+    Note over Client,Other: Initial Connection & Leaderboard View
+    
+    Client->>LB: GET /api/v1/leaderboard/top
+    LB->>API: Forward Request
+    API->>Redis: ZREVRANGE leaderboard:global
+    alt Cache Hit
+        Redis-->>API: Top 10 Users Data
+    else Cache Miss
+        API->>DB: SELECT * FROM users ORDER BY total_score DESC LIMIT 10
+        DB-->>API: User Records
+        API->>Redis: ZADD leaderboard:global
+        Redis-->>API: OK
+    end
+    API-->>Client: 200 OK + Leaderboard JSON
+    
+    Note over Client,Other: WebSocket Connection for Real-Time Updates
+    
+    Client->>LB: WS /api/v1/leaderboard/stream
+    LB->>WS: Upgrade Connection
+    WS->>Auth: Validate JWT Token
+    Auth-->>WS: Token Valid
+    WS-->>Client: Connection Established
+    WS->>Redis: GET leaderboard:global
+    Redis-->>WS: Current Leaderboard
+    WS-->>Client: Initial Snapshot
+
+    Note over Client,Other: User Completes Action - Token Generation
+    
+    Client->>LB: POST /api/v1/actions/generate-token<br/>{action_type: "COMPLETE_MISSION"}
+    LB->>API: Forward Request
+    API->>Auth: Validate User Session
+    Auth-->>API: User Authenticated
+    
+    API->>Score: ValidateActionEligibility(user, action_type)
+    Score->>DB: Check recent actions, prevent farming
+    DB-->>Score: Eligible
+    Score->>Score: CalculateScoreValue(action_type, difficulty)
+    Note right of Score: Server calculates score<br/>Client cannot manipulate
+    
+    Score->>Score: GenerateJWT(user_id, action_type, score_value, nonce)
+    Score->>DB: INSERT INTO action_tokens<br/>(token_hash, user_id, score_value, expires_at)
+    DB-->>Score: Token Stored
+    Score-->>API: Action Token + Expiration
+    API-->>Client: 200 OK<br/>{action_token: "eyJhbGc...", expires_at: "...", score_value: 100}
+
+    Note over Client,Other: User Submits Completed Action
+    
+    Client->>LB: POST /api/v1/scores/submit<br/>{action_token: "eyJhbGc..."}
+    LB->>API: Forward Request
+    API->>Auth: Validate User Session
+    Auth-->>API: User Authenticated
+    
+    API->>Score: ValidateAndProcessScore(action_token, user_id)
+    Score->>Score: Verify JWT Signature
+    Score->>Score: Check Token Expiration (< 5 min)
+    Score->>Score: Verify token.sub == user_id
+    
+    Score->>Redis: EXISTS token:used:{token_hash}
+    Redis-->>Score: Not Found (Good)
+    
+    Score->>DB: SELECT * FROM action_tokens<br/>WHERE token_hash = ? AND used_at IS NULL
+    DB-->>Score: Token Found, Not Used
+    
+    Note right of Score: Begin Database Transaction
+    Score->>DB: BEGIN TRANSACTION
+    Score->>DB: UPDATE users SET total_score = total_score + 100<br/>WHERE id = ? RETURNING *
+    DB-->>Score: Updated User (new_score: 1600)
+    
+    Score->>DB: INSERT INTO score_transactions<br/>(user_id, score_delta, previous_score, new_score, token_hash)
+    DB-->>Score: Transaction Recorded
+    
+    Score->>DB: UPDATE action_tokens<br/>SET used_at = NOW() WHERE token_hash = ?
+    DB-->>Score: Token Marked Used
+    Score->>DB: COMMIT TRANSACTION
+    
+    Note right of Score: Update Cache
+    Score->>Redis: ZINCRBY leaderboard:global 100 {user_id}
+    Redis-->>Score: New Score: 1600
+    Score->>Redis: SETEX token:used:{token_hash} 3600 "1"
+    Redis-->>Score: Token Blacklisted
+    Score->>Redis: HSET user:score:{user_id} score 1600
+    Redis-->>Score: Cache Updated
+    
+    Score->>Redis: ZREVRANK leaderboard:global {user_id}
+    Redis-->>Score: Rank: 5
+    
+    Score-->>API: Success + User Data + Rank
+    API-->>Client: 200 OK<br/>{success: true, new_score: 1600, rank: 5}
+    
+    Note over Client,Other: Broadcast Leaderboard Update via WebSocket
+    
+    API->>WS: PublishLeaderboardUpdate(user_id, score_delta, new_rank)
+    WS->>Redis: PUBLISH leaderboard:updates {user_id, new_score, new_rank}
+    Redis-->>WS: Published
+    WS->>Redis: ZREVRANGE leaderboard:global 0 9 WITHSCORES
+    Redis-->>WS: Top 10 with Scores
+    
+    WS-->>Client: WebSocket Message<br/>{type: "leaderboard_update", changes: [...], leaderboard: [...]}
+    WS-->>Other: Broadcast to All Connected Clients<br/>{type: "leaderboard_update", ...}
+    
+    Note over Client,Other: Security - Replay Attack Prevention
+    
+    Client->>LB: POST /api/v1/scores/submit<br/>{action_token: "eyJhbGc..."} (Same Token)
+    LB->>API: Forward Request
+    API->>Score: ValidateAndProcessScore(action_token, user_id)
+    Score->>Redis: EXISTS token:used:{token_hash}
+    Redis-->>Score: Found! (Token Already Used)
+    Score-->>API: Error: Token Already Used
+    API-->>Client: 409 Conflict<br/>{error: "Token already used", code: "REPLAY_ATTACK"}
+    
+    Note over Client,Other: Security - Expired Token
+    
+    Client->>LB: POST /api/v1/scores/submit<br/>{action_token: "expired_token"}
+    LB->>API: Forward Request
+    API->>Score: ValidateAndProcessScore(action_token, user_id)
+    Score->>Score: Verify JWT Signature
+    Score->>Score: Check Token Expiration
+    Note right of Score: Token expired > 5 minutes ago
+    Score-->>API: Error: Token Expired
+    API-->>Client: 400 Bad Request<br/>{error: "Token expired", code: "TOKEN_EXPIRED"}
