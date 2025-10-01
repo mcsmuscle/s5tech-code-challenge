@@ -3,7 +3,7 @@
 This repository contains my solutions for the S5Tech Code Challenge.  
 Each problem is implemented in a separate folder.
 
-## Problems
+## Problem Set - Full Stack
 
 - **Problem 2 – Fancy Form**  
   A currency swap form with real-time token prices, token icons, validation.
