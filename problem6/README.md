@@ -3,6 +3,44 @@
 ## Overview
 This module implements a secure, real-time leaderboard system that tracks and displays the top 10 users by score. The system prevents unauthorized score manipulation through cryptographic verification and implements efficient real-time updates using WebSocket connections.
 
+## Tech Stack
+
+This specification requires the following core technologies, as detailed in the architecture sections.
+
+### 1. Core Backend Technologies
+
+*   **Runtime Environment**: Node.js (v18+) or any other modern backend runtime capable of handling high concurrency.
+*   **Database (Primary Storage)**: **PostgreSQL**. Used for storing user data, score transactions (audit trail), and action tokens.
+*   **Cache & Real-Time Data Store**: **Redis Cluster**.
+    *   **Sorted Sets (Z-SET)**: For implementing the high-performance leaderboard (`leaderboard:global`).
+    *   **Hashes**: For caching individual user scores (`user:score:{user_id}`).
+    *   **Key-Value with TTL**: For blacklisting used tokens (`token:used:{token_hash}`).
+    *   **Pub/Sub**: For broadcasting updates across multiple WebSocket server instances to enable horizontal scaling.
+*   **Real-Time Communication**: **WebSocket**. Manages persistent connections for live leaderboard updates (`/api/v1/leaderboard/stream`).
+*   **Authentication & Authorization**: **JSON Web Tokens (JWT)**.
+    *   **Access Tokens**: For securing API endpoints.
+    *   **Action Tokens**: Custom JWTs generated for authorizing single-use score updates, preventing replay attacks.
+*   **Message Queue (Optional for Scaling)**: RabbitMQ or Kafka. Mentioned as a potential component for asynchronous processing in a large-scale architecture.
+
+### 2. Security & Infrastructure
+
+*   **Rate Limiting Algorithm**: **Sliding Window Algorithm** implemented with Redis for both user-level and IP-level limits.
+*   **Reverse Proxy / Load Balancer**: NGINX or AWS ALB. Manages incoming HTTP/WebSocket traffic and distributes it to API server instances.
+*   **SSL Termination**: Let's Encrypt, AWS Certificate Manager, or Cloudflare for securing communications (HTTPS/WSS).
+
+### 3. Development & Testing Tools
+
+*   **API Testing**: Postman or Insomnia (including WebSocket testing capabilities).
+*   **Database Management**: pgAdmin for PostgreSQL.
+*   **Load Testing**: Tools like k6, JMeter, or Locust to simulate high traffic as outlined in the "Load Tests" section.
+*   **Containerization**: Docker (for development consistency) and Kubernetes (for production orchestration).
+
+### 4. Monitoring & Observability
+
+*   **Metrics Collection**: Prometheus, Datadog, or similar tools to track key metrics (e.g., cache hit ratio, latency).
+*   **Logging**: Structured logging (JSON format) aggregated by a system like ELK Stack (Elasticsearch, Logstash, Kibana) or Datadog Logs.
+*   **Error Tracking**: Sentry or a similar service for real-time error reporting and alerting.
+
 ## Architecture Components
 
 ### 1. Core Services
@@ -503,32 +541,66 @@ LOG_LEVEL=info
   - Memory: 4GB
   - Network: 1Gbps
 
-## Testing Strategy
+## 9. Testing Checklist
 
-### 9.1 Unit Tests
-- Token generation and validation
-- Score calculation logic
-- Cache invalidation logic
-- Rate limiting enforcement
+This checklist outlines the minimum required tests to ensure the system is robust, secure, and performant. Tests should be automated where possible.
 
-### 9.2 Integration Tests
-- End-to-end score update flow
-- WebSocket connection and broadcasting
-- Database transaction rollback
-- Cache consistency
+### 9.1 API Endpoint Tests: Core Functionality & Security
 
-### 9.3 Load Tests
-- Concurrent score updates (1000 RPS)
-- WebSocket connection stress test (10,000 connections)
-- Cache performance under load
-- Database query performance
+#### `POST /api/v1/actions/generate-token`
+- [ ] **Success Case**: A valid, authenticated user can generate a token and the token hash is stored correctly in the `action_tokens` table.
+- [ ] **Authentication Failure**: Request with a missing, invalid, or expired JWT access token returns a `401 Unauthorized` error.
+- [ ] **Rate Limiting**: Exceeding the request limit (e.g., >60 requests/minute) for a single user returns a `429 Too Many Requests` error.
+- [ ] **Abuse Prevention**: Test logic that prevents token farming (e.g., user cannot generate tokens too frequently without completing actions).
 
-### 9.4 Security Tests
-- Replay attack simulation
-- Token forgery attempts
-- Rate limit enforcement
-- SQL injection prevention
-- XSS prevention
+#### `POST /api/v1/scores/submit`
+- [ ] **Valid Score Update**: A valid `action_token` successfully increments the user's `total_score`, creates a `score_transactions` record, and marks the `action_token` as used. The response contains the correct `new_score` and `leaderboard_position`.
+- [ ] **Invalid Token**: Submitting a malformed or non-existent token returns a `400 Bad Request`.
+- [ ] **Expired Token**: Submitting a token after its 5-minute expiration window returns a `400 Bad Request`.
+- [ ] **Used Token (Replay Attack)**: Submitting the same valid token a second time returns a `409 Conflict` error, both by checking the Redis blacklist and the database `used_at` field.
+- [ ] **Token Ownership Mismatch**: User A attempting to use a token generated for User B returns a `403 Forbidden` error.
+- [ ] **Authentication Failure**: Submitting a score with an invalid JWT access token returns a `401 Unauthorized`.
+- [ ] **Rate Limiting**: Exceeding the submission limit (e.g., >30 requests/minute) returns a `429 Too Many Requests`.
+
+#### `GET /api/v1/leaderboard/top`
+- [ ] **Success Case (Cache Miss)**: The first request correctly queries the database, returns the top 10 users, and populates the Redis cache.
+- [ ] **Success Case (Cache Hit)**: A subsequent request within the 60-second TTL returns the cached leaderboard data without hitting the database.
+- [ ] **Parameter Handling**: Verify that `limit` and `offset` query parameters work as expected and are capped at the maximum allowed value (100).
+
+#### `GET /api/v1/users/{user_id}/rank`
+- [ ] **Success Case**: Correctly returns the user's rank, score, and percentile by querying Redis (`ZREVRANK`, `ZSCORE`).
+- [ ] **User Not Found**: Requesting a rank for a non-existent user ID returns a `404 Not Found`.
+
+### 9.2 WebSocket Tests: Real-Time Functionality
+
+- [ ] **Connection Authentication**: A client with a valid JWT access token can successfully establish a WebSocket connection. An invalid token results in connection termination.
+- [ ] **Initial State Snapshot**: Upon successful connection, the client immediately receives the current top 10 leaderboard snapshot.
+- [ ] **Leaderboard Update Broadcast**: A score update that changes the top 10 rankings (e.g., a user enters the top 10, or positions change within the top 10) triggers a `leaderboard_update` message to all connected clients.
+- [ ] **No Broadcast on Minor Changes**: A score update for a user ranked outside the top 10 (which does not affect the top 10) **does not** trigger a broadcast. This is critical for performance.
+- [ ] **Multiple Clients**: All connected clients receive the same update simultaneously.
+- [ ] **Disconnection/Reconnection**: A client can gracefully disconnect and reconnect, receiving the latest leaderboard snapshot upon reconnection.
+- [ ] **Heartbeat Mechanism**: The server correctly handles `ping` messages from the client and responds appropriately to maintain the connection.
+
+### 9.3 Integration & System Tests
+
+- [ ] **End-to-End Flow**: Simulate the full user journey: generate token -> submit score -> verify database and cache updates -> confirm WebSocket broadcast is received by other clients.
+- [ ] **Database Transaction Integrity**: Force a failure mid-transaction (e.g., after updating `users` table but before updating `action_tokens`). Verify that the entire transaction is rolled back and the database remains in a consistent state.
+- [ ] **Cache Consistency**: Verify that after a score update, both the database and Redis (sorted set and user score cache) contain the same, correct score.
+- [ ] **Token Cleanup**: If a cleanup job is implemented, verify that it correctly removes old, expired tokens from the `action_tokens` table without affecting active ones.
+
+### 9.4 Load & Performance Tests
+
+- [ ] **Concurrent Score Updates**: Test the system with a high rate of concurrent score submissions (target: 1000 RPS). Monitor API response times (p95, p99 < 500ms) and database CPU usage.
+- [ ] **WebSocket Connection Scalability**: Stress test the system by maintaining a large number of concurrent WebSocket connections (target: 10,000 per instance). Monitor server memory usage and message latency.
+- [ ] **Database Performance Under Load**: Ensure that leaderboard queries (`ORDER BY total_score DESC`) remain fast (< 50ms) even with millions of users in the `users` table.
+- [ ] **Cache Performance**: Measure the cache hit/miss ratio under a realistic load. The hit ratio for the main leaderboard should be high (>80%).
+
+### 9.5 Security & Failure Scenario Tests
+
+- [ ] **Token Forgery Attempts**: Attempt to submit score updates with manually crafted JWTs (invalid signature, modified payload). These must be rejected.
+- [ ] **SQL Injection**: Test all endpoints with potential SQL injection payloads to ensure inputs are properly sanitized.
+- [ ] **Graceful Degradation (Redis Failure)**: Simulate a Redis outage. Verify that the system can gracefully fall back to the database for leaderboard queries without crashing.
+- [ ] **Graceful Degradation (Database Failure)**: Simulate a database write failure. Verify that API calls return a `500 Internal Server Error` and transactions are rolled back, preventing data corruption.
 
 ## API Client Example
 
@@ -636,5 +708,5 @@ class LeaderboardClient {
 ---
 
 **Document Version**: 1.0  
-**Last Updated**: October 1, 2025  
+**Last Updated**: Jan 1, 2025  
 **Review Status**: Ready for Implementation
